@@ -3,6 +3,8 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Qwix](https://img.shields.io/badge/Built%20with-Qwix-green.svg)](https://github.com/google/qwix)
 
+> **Note:** The project is in initial stages. More models need to be tested with different datasets, with the core technique working.
+
 **LQER** extends [Qwix](https://github.com/google/qwix) (Google's JAX quantization library) with **low-rank error correction** to significantly improve Post-Training Quantization (PTQ) accuracy.
 
 ## What is LQER?
@@ -163,6 +165,17 @@ LqerRule(..., rank=32)  # ~40-60% improvement, higher storage
 - **JAX**: 0.4.20+
 - **Flax**: 0.8.0+
 - **Python**: 3.10+
+
+## TODO
+
+Future work and testing planned:
+
+- [ ] Test on Llama 1 and Llama 2 models
+- [ ] Evaluate on WikiText-103 dataset
+- [ ] Conduct comprehensive accuracy benchmarks on real models
+- [ ] Perform runtime performance testing and profiling
+- [ ] Compare with other quantization methods (GPTQ, AWQ)
+- [ ] Add support for more model architectures
 
 ## Citing
 
