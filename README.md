@@ -171,6 +171,7 @@ LqerRule(..., rank=32)  # ~40-60% improvement, higher storage
 Future work and testing planned:
 
 - [ ] Test on Llama 1 and Llama 2 models
+- [ ] Add Runtime profiling logic and test on GPU/TPU (currently only tested on CPU) 
 - [ ] Evaluate on WikiText-103 dataset
 - [ ] Conduct comprehensive accuracy benchmarks on real models
 - [ ] Perform runtime performance testing and profiling

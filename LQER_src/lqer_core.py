@@ -5,33 +5,27 @@ This module provides the core functionality for LQER quantization:
 - LqerWeight: Container for quantized weight + error correction matrices
 - lqer_quantize_params: Function to quantize parameters with LQER
 - LqerProvider: Inference provider that applies error correction
-- benchmark_lqer_model: Helper function for accurate per-layer timing
+- profile_lqer_model: Function to profile LQER models using JAX profiler
 
-Timing/Benchmarking:
-    For per-layer runtime benchmarking, use:
+Profiling:
+    To profile the LQER model and analyze dot_general performance:
     
-    1. Enable timing in LqerProvider:
-       provider = LqerProvider(rules, enable_timing=True)
+    >>> from LQER_src.lqer_core import profile_lqer_model
+    >>> trace_dir = profile_lqer_model(model, params, input_data)
+    >>> # View trace at https://ui.perfetto.dev
     
-    2. Use benchmark_lqer_model() for accurate results:
-       results = benchmark_lqer_model(model, params, input, num_runs=10)
-    
-    3. Or access timing data directly:
-       LqerProvider.print_timings()
-       timings = LqerProvider.get_timings()
-    
-    Note: For most accurate per-layer timing, consider using JAX's profiler:
-    ```python
-    with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
-        output = model.apply(variables, input)
-        output.block_until_ready()
-    ```
+    The trace will include annotations for:
+    - LQER_dot_general: Main LQER computation
+    - LQER_dequantize_and_matmul: Quantized weight path
+    - LQER_error_correction: Error correction computation
+    - LQER_error_matmul_simple/complex: Error matrix multiplications
+    - LQER_final_add: Final addition step
 """
 
 import dataclasses
 from typing import Any, Callable
 import re
-import time
+import os
 import jax
 import jax.numpy as jnp
 import flax
@@ -41,7 +35,13 @@ from qwix._src.providers import ptq
 from qwix._src import qconfig
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Get project root directory
+_PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Default trace directory in project tmp folder
+_DEFAULT_TRACE_DIR = _PROJECT_ROOT / "tmp"
 
 
 from experiments.models.transformer import SimpleTransformer
@@ -66,7 +66,6 @@ class LqerWeight:
     w_q: qwix.QArray  # Quantized weight
     error_a: jax.Array  # Low-rank error matrix A (U * S)
     error_b: jax.Array  # Low-rank error matrix B (Vh)
-    layer_id: str = ""  # Identifier for this layer (e.g., parameter path)
     
     @property
     def shape(self):
@@ -150,12 +149,10 @@ def lqer_quantize_params(fp_params, abs_ptq_params, rules: list[LqerRule], debug
                 print(f"    -> LQER quantized: rank={k}, error_a={error_a.shape}, error_b={error_b.shape}")
             
             # 4. Store as LqerWeight directly (NOT inside WithAux)
-            # Include layer_id for timing/benchmarking purposes
             lqer_container = LqerWeight(
                 w_q=w_q_array, 
                 error_a=error_a, 
-                error_b=error_b,
-                layer_id=path_str
+                error_b=error_b
             )
             quantized_params[path] = lqer_container
         else:
@@ -176,15 +173,11 @@ class LqerProvider(qconfig.QuantizationProvider):
     - Final output: y = y_q + correction
     """
     
-    def __init__(self, rules, enable_timing=False):
+    def __init__(self, rules):
         super().__init__(rules)
-        self.enable_timing = enable_timing
     
     # Class-level counters to track which code paths are executed
     _path_counts = {'lqer': 0, 'withaux_lqer': 0, 'withaux_qarray': 0, 'fallback': 0}
-    
-    # Class-level timing data: {layer_id: [time1, time2, ...]}
-    _layer_timings = {}
     
     def promote_dtype(self, *args, **kwargs):
         """Intercept promote_dtype to skip LqerWeight (handled later in dot_general)."""
@@ -201,84 +194,11 @@ class LqerProvider(qconfig.QuantizationProvider):
         cls._path_counts = {'lqer': 0, 'withaux_lqer': 0, 'withaux_qarray': 0, 'fallback': 0}
     
     @classmethod
-    def reset_timings(cls):
-        """Reset all layer timing data."""
-        cls._layer_timings = {}
-    
-    @classmethod
     def print_counts(cls):
         print("\n[DEBUG] Code path execution counts:")
         for path, count in cls._path_counts.items():
             status = "✓ CALLED" if count > 0 else "✗ NOT CALLED"
             print(f"  - {path}: {count} times ({status})")
-    
-    @classmethod
-    def get_timings(cls) -> dict[str, list[float]]:
-        """Get timing data for all layers.
-        
-        Returns:
-            Dict mapping layer_id to list of execution times (in seconds).
-        """
-        return cls._layer_timings.copy()
-    
-    @classmethod
-    def print_timings(cls, summary=True):
-        """Print timing statistics for all layers.
-        
-        Args:
-            summary: If True, print summary statistics. If False, print all individual timings.
-        """
-        if not cls._layer_timings:
-            print("\n[Timing] No timing data collected.")
-            return
-        
-        print("\n" + "=" * 70)
-        print("LAYER TIMING BENCHMARKS")
-        print("=" * 70)
-        
-        # Calculate statistics
-        stats = []
-        for layer_id, times in cls._layer_timings.items():
-            if times:
-                total = sum(times)
-                mean = total / len(times)
-                min_time = min(times)
-                max_time = max(times)
-                stats.append({
-                    'layer_id': layer_id,
-                    'count': len(times),
-                    'total_ms': total * 1000,
-                    'mean_ms': mean * 1000,
-                    'min_ms': min_time * 1000,
-                    'max_ms': max_time * 1000,
-                })
-        
-        # Sort by total time (descending)
-        stats.sort(key=lambda x: x['total_ms'], reverse=True)
-        
-        # Print table
-        print(f"\n{'Layer ID':<40} {'Count':<8} {'Total (ms)':<12} {'Mean (ms)':<12} {'Min (ms)':<12} {'Max (ms)':<12}")
-        print("-" * 100)
-        for stat in stats:
-            print(f"{stat['layer_id']:<40} {stat['count']:<8} {stat['total_ms']:<12.3f} {stat['mean_ms']:<12.3f} {stat['min_ms']:<12.3f} {stat['max_ms']:<12.3f}")
-        
-        if not summary:
-            print("\nDetailed timings:")
-            for layer_id, times in cls._layer_timings.items():
-                print(f"\n  {layer_id}:")
-                for i, t in enumerate(times):
-                    print(f"    Call {i+1}: {t*1000:.3f} ms")
-        
-        total_time = sum(sum(times) for times in cls._layer_timings.values())
-        print(f"\nTotal execution time: {total_time*1000:.3f} ms")
-        print("=" * 70)
-    
-    def _record_timing(self, layer_id: str, duration: float):
-        """Record timing for a layer (side effect, safe in JAX)."""
-        if self.enable_timing:
-            if layer_id not in LqerProvider._layer_timings:
-                LqerProvider._layer_timings[layer_id] = []
-            LqerProvider._layer_timings[layer_id].append(duration)
     
     def dot_general(
         self,
@@ -296,41 +216,39 @@ class LqerProvider(qconfig.QuantizationProvider):
         if isinstance(rhs, LqerWeight):
             LqerProvider._path_counts['lqer'] += 1
             
-            # Start timing if enabled
-            start_time = time.perf_counter() if self.enable_timing else None
-            
-            # 1. Dequantize and compute main quantized path
-            w_dequant = qwix.dequantize(rhs.w_q)
-            y_q = jax.lax.dot_general(
-                lhs, w_dequant, dimension_numbers,
-                precision=precision,
-                preferred_element_type=preferred_element_type,
-            )
-            
-            # 2. Compute error correction: (lhs @ A) @ B
-            # This is the key LQER contribution - low-rank error reconstruction
-            (lhs_ca, rhs_ca), (lhs_ba, rhs_ba) = dimension_numbers
-            
-            # For simple matmul (no batch dims): just do sequential matmuls
-            if not lhs_ba and not rhs_ba and len(lhs_ca) == 1 and len(rhs_ca) == 1:
-                intermediate = lhs @ rhs.error_a  # (..., k)
-                correction = intermediate @ rhs.error_b  # (..., out)
-            else:
-                # Fallback for more complex dimension cases
-                intermediate = jax.lax.dot_general(
-                    lhs, rhs.error_a, dimension_numbers,
-                    precision=precision,
-                    preferred_element_type=preferred_element_type,
-                )
-                correction = intermediate @ rhs.error_b
-            
-            result = y_q + correction
-            
-            # Record timing if enabled
-            if self.enable_timing and start_time is not None:
-                layer_id = rhs.layer_id if rhs.layer_id else f"unknown_{id(rhs)}"
-                duration = time.perf_counter() - start_time
-                self._record_timing(layer_id, duration)
+            # Add profiler annotation for LQER path
+            with jax.named_scope("LQER_dot_general"):
+                # 1. Dequantize and compute main quantized path
+                with jax.named_scope("LQER_dequantize_and_matmul"):
+                    w_dequant = qwix.dequantize(rhs.w_q)
+                    y_q = jax.lax.dot_general(
+                        lhs, w_dequant, dimension_numbers,
+                        precision=precision,
+                        preferred_element_type=preferred_element_type,
+                    )
+                
+                # 2. Compute error correction: (lhs @ A) @ B
+                # This is the key LQER contribution - low-rank error reconstruction
+                (lhs_ca, rhs_ca), (lhs_ba, rhs_ba) = dimension_numbers
+                
+                with jax.named_scope("LQER_error_correction"):
+                    # For simple matmul (no batch dims): just do sequential matmuls
+                    if not lhs_ba and not rhs_ba and len(lhs_ca) == 1 and len(rhs_ca) == 1:
+                        with jax.named_scope("LQER_error_matmul_simple"):
+                            intermediate = lhs @ rhs.error_a  # (..., k)
+                            correction = intermediate @ rhs.error_b  # (..., out)
+                    else:
+                        # Fallback for more complex dimension cases
+                        with jax.named_scope("LQER_error_matmul_complex"):
+                            intermediate = jax.lax.dot_general(
+                                lhs, rhs.error_a, dimension_numbers,
+                                precision=precision,
+                                preferred_element_type=preferred_element_type,
+                            )
+                            correction = intermediate @ rhs.error_b
+                
+                with jax.named_scope("LQER_final_add"):
+                    result = y_q + correction
             
             return result
         
@@ -341,28 +259,31 @@ class LqerProvider(qconfig.QuantizationProvider):
             rhs_array = rhs.array
             if isinstance(rhs_array, LqerWeight):
                 LqerProvider._path_counts['withaux_lqer'] += 1
-                return self.dot_general(
-                    lhs, rhs_array, dimension_numbers,
-                    precision=precision,
-                    preferred_element_type=preferred_element_type,
-                    **kwargs
-                )
+                with jax.named_scope("LQER_withaux_path"):
+                    return self.dot_general(
+                        lhs, rhs_array, dimension_numbers,
+                        precision=precision,
+                        preferred_element_type=preferred_element_type,
+                        **kwargs
+                    )
             # Standard QArray from PTQ
             LqerProvider._path_counts['withaux_qarray'] += 1
-            rhs_dequant = qwix.dequantize(rhs_array)
-            return jax.lax.dot_general(
-                lhs, rhs_dequant, dimension_numbers,
-                precision=precision,
-                preferred_element_type=preferred_element_type,
-            )
+            with jax.named_scope("PTQ_withaux_path"):
+                rhs_dequant = qwix.dequantize(rhs_array)
+                return jax.lax.dot_general(
+                    lhs, rhs_dequant, dimension_numbers,
+                    precision=precision,
+                    preferred_element_type=preferred_element_type,
+                )
         
         # PATH 3: Fallback for regular jax arrays (non-quantized layers)
         LqerProvider._path_counts['fallback'] += 1
-        return jax.lax.dot_general(
-            lhs, rhs, dimension_numbers,
-            precision=precision,
-            preferred_element_type=preferred_element_type,
-        )
+        with jax.named_scope("LQER_fallback_path"):
+            return jax.lax.dot_general(
+                lhs, rhs, dimension_numbers,
+                precision=precision,
+                preferred_element_type=preferred_element_type,
+            )
     
     def get_intercept_map(self) -> dict[str, Callable[..., Any]]:
         """Define which JAX functions to intercept."""
@@ -395,7 +316,7 @@ def test_simple_mlp():
     for rank in [8, 16]:
         print(f"\n--- Testing with rank={rank} ---")
         rules = [LqerRule(module_path='.*', weight_qtype=jnp.int4, rank=rank)]
-        _run_single_test(model, fp_variables, fp_output, model_input, rules, key, enable_timing=True)
+        _run_single_test(model, fp_variables, fp_output, model_input, rules, key, enable_profiling=True)
 
 
 def test_transformer():
@@ -449,7 +370,7 @@ def test_transformer():
     rank = 16
     print(f"\n--- Testing with rank={rank} ---")
     rules = [LqerRule(module_path='.*', weight_qtype=jnp.int4, rank=rank)]
-    _run_single_test(model, fp_variables, fp_output, tokens, rules, key, enable_timing=True)
+    _run_single_test(model, fp_variables, fp_output, tokens, rules, key, enable_profiling=True)
 
 
 def run_lqer_test():
@@ -469,92 +390,87 @@ def run_lqer_test():
     print("=" * 70)
 
 
-def benchmark_lqer_model(
+def profile_lqer_model(
     model,
     lqer_params: dict,
     model_input: Any,
+    trace_dir: str | Path = None,
     num_warmup: int = 3,
-    num_runs: int = 10,
-    verbose: bool = True,
-) -> dict[str, Any]:
+    num_runs: int = 5,
+    create_perfetto_link: bool = False,
+):
     """
-    Benchmark LQER model with proper JAX blocking for accurate per-layer timing.
+    Profile LQER model using JAX profiler.
     
-    This function runs the model multiple times and properly blocks after each execution
-    to get accurate timing measurements. It's the recommended way to benchmark LQER models.
-    
-    IMPORTANT: The model must be created with a LqerProvider that has enable_timing=True
-    for this function to collect per-layer timings.
+    This function runs the model with JAX profiling enabled and generates a trace
+    that can be viewed in Perfetto (https://ui.perfetto.dev).
     
     Args:
-        model: The quantized LQER model (must be created with LqerProvider(enable_timing=True))
+        model: The quantized LQER model
         lqer_params: Quantized parameters dict
         model_input: Input to the model
-        num_warmup: Number of warmup runs (to compile JIT, etc.)
-        num_runs: Number of benchmark runs
-        verbose: If True, print timing results
+        trace_dir: Directory to save trace files (default: project_root/tmp/jax-trace)
+        num_warmup: Number of warmup runs before profiling
+        num_runs: Number of profiled runs
+        create_perfetto_link: If True, tries to create a local server link (may fail if port in use)
     
     Returns:
-        Dict with timing statistics: {
-            'layer_timings': {layer_id: [times...]},
-            'total_time': total execution time (seconds),
-            'mean_time': mean execution time per run (seconds),
-            'num_runs': number of benchmark runs,
-        }
-    
-    Example:
-        >>> rules = [LqerRule(module_path='.*', weight_qtype=jnp.int4, rank=16)]
-        >>> provider = LqerProvider(rules, enable_timing=True)
-        >>> model = qwix.quantize_model(base_model, provider)
-        >>> params = lqer_quantize_params(fp_params, abs_params, rules)
-        >>> results = benchmark_lqer_model(model, params, input_data, num_runs=20)
+        Path to the trace directory (as string)
     """
-    # Run warmup
-    if verbose:
-        print(f"Warming up ({num_warmup} runs)...")
+    # Use default trace directory if not specified
+    if trace_dir is None:
+        trace_dir = str(_DEFAULT_TRACE_DIR / "jax-trace")
+    else:
+        trace_dir = str(trace_dir)
+    # JIT compile the apply function
+    @jax.jit
+    def apply_model(variables, inputs):
+        return model.apply(variables, inputs)
+    
+    # Warmup runs to compile JIT
+    print(f"Warming up ({num_warmup} runs)...")
     for _ in range(num_warmup):
-        output = model.apply({'params': lqer_params}, model_input)
-        output.block_until_ready()
+        _ = apply_model({'params': lqer_params}, model_input)
+        _.block_until_ready()
     
-    # Reset timings before benchmark
-    LqerProvider.reset_timings()
+    # Create trace directory
+    os.makedirs(trace_dir, exist_ok=True)
     
-    # Benchmark runs
-    if verbose:
-        print(f"Benchmarking ({num_runs} runs)...")
+    # Profile the model
+    print(f"Profiling ({num_runs} runs)...")
+    print(f"Trace will be saved to: {trace_dir}")
     
-    total_start = time.perf_counter()
-    for run_idx in range(num_runs):
-        output = model.apply({'params': lqer_params}, model_input)
-        output.block_until_ready()  # Block to ensure computation completes
-        
-        if verbose and (run_idx + 1) % max(1, num_runs // 10) == 0:
-            print(f"  Run {run_idx + 1}/{num_runs} completed")
-    
-    total_end = time.perf_counter()
-    total_time = total_end - total_start
-    mean_time = total_time / num_runs
-    
-    timings = LqerProvider.get_timings()
-    
-    if verbose:
-        print(f"\nBenchmark complete:")
-        print(f"  Total time: {total_time*1000:.2f} ms")
-        print(f"  Mean time per run: {mean_time*1000:.2f} ms")
-        if timings:
-            LqerProvider.print_timings()
+    # Try to create perfetto link, but handle port conflicts gracefully
+    try:
+        with jax.profiler.trace(trace_dir, create_perfetto_link=create_perfetto_link):
+            for run_idx in range(num_runs):
+                with jax.profiler.TraceAnnotation(f"LQER_inference_run_{run_idx}"):
+                    output = apply_model({'params': lqer_params}, model_input)
+                    output.block_until_ready()
+    except OSError as e:
+        if "Address already in use" in str(e) and create_perfetto_link:
+            # Port conflict - retry without the server
+            print(f"Warning: Port conflict when creating Perfetto link. Retrying without server...")
+            with jax.profiler.trace(trace_dir, create_perfetto_link=False):
+                for run_idx in range(num_runs):
+                    with jax.profiler.TraceAnnotation(f"LQER_inference_run_{run_idx}"):
+                        output = apply_model({'params': lqer_params}, model_input)
+                        output.block_until_ready()
         else:
-            print("  Note: No per-layer timings collected. Ensure model was created with enable_timing=True")
+            raise
     
-    return {
-        'layer_timings': timings,
-        'total_time': total_time,
-        'mean_time': mean_time,
-        'num_runs': num_runs,
-    }
+    print(f"\nProfiling complete!")
+    print(f"Trace saved to: {trace_dir}")
+    print(f"\nTo view the trace:")
+    print(f"  1. Go to https://ui.perfetto.dev")
+    print(f"  2. Click 'Open trace file'")
+    print(f"  3. Navigate to: {trace_dir}")
+    print(f"  4. Select the trace file (usually named with a timestamp)")
+    
+    return trace_dir
 
 
-def _run_single_test(model, fp_variables, fp_output, model_input, rules, key, enable_timing=False):
+def _run_single_test(model, fp_variables, fp_output, model_input, rules, key, enable_profiling=True):
     """Run a single LQER test with the given rules.
     
     Args:
@@ -564,29 +480,45 @@ def _run_single_test(model, fp_variables, fp_output, model_input, rules, key, en
         model_input: Input to the model
         rules: LQER quantization rules
         key: JAX random key
-        enable_timing: If True, collect and print timing benchmarks
+        enable_profiling: If True, enable JAX profiling
     """
     # Quantize the Model (Architecture only)
-    lqer_model = qwix.quantize_model(model, LqerProvider(rules, enable_timing=enable_timing))
+    lqer_model = qwix.quantize_model(model, LqerProvider(rules))
     
     # Quantize the Params (The SVD happens here!)
     temp_ptq_model = qwix.quantize_model(model, qwix.PtqProvider(rules))
     abs_ptq_params = jax.eval_shape(temp_ptq_model.init, key, model_input)['params']
     lqer_params = lqer_quantize_params(fp_variables['params'], abs_ptq_params, rules, debug=False)
     
-    # Run Inference
+    # Run Inference with JIT compilation
     LqerProvider.reset_counts()
-    if enable_timing:
-        LqerProvider.reset_timings()
     
-    lqer_output = lqer_model.apply({'params': lqer_params}, model_input)
+    # JIT compile the apply function for better performance
+    @jax.jit
+    def apply_model(variables, inputs):
+        return lqer_model.apply(variables, inputs)
+    
+    # Warmup run to compile JIT
+    _ = apply_model({'params': lqer_params}, model_input)
+    _.block_until_ready()
+    
+    # Profile if enabled
+    if enable_profiling:
+        trace_dir = _DEFAULT_TRACE_DIR / f"jax-trace-lqer-{id(model)}"
+        profile_lqer_model(
+            lqer_model, 
+            lqer_params, 
+            model_input, 
+            trace_dir=trace_dir,
+            create_perfetto_link=False  # Disable server to avoid port conflicts
+        )
+    
+    # Actual inference
+    lqer_output = apply_model({'params': lqer_params}, model_input)
+    lqer_output.block_until_ready()
     
     # Show which code paths were executed
     LqerProvider.print_counts()
-    
-    # Print timing if enabled
-    if enable_timing:
-        LqerProvider.print_timings()
     
     # Compare with FP32
     max_diff = jnp.max(jnp.abs(fp_output - lqer_output))
@@ -595,7 +527,13 @@ def _run_single_test(model, fp_variables, fp_output, model_input, rules, key, en
     # Also test standard PTQ for comparison
     ptq_model = qwix.quantize_model(model, qwix.PtqProvider(rules))
     ptq_params = qwix.quantize_params(fp_variables['params'], abs_ptq_params)
-    ptq_output = ptq_model.apply({'params': ptq_params}, model_input)
+    
+    @jax.jit
+    def apply_ptq_model(variables, inputs):
+        return ptq_model.apply(variables, inputs)
+    
+    ptq_output = apply_ptq_model({'params': ptq_params}, model_input)
+    ptq_output.block_until_ready()
     
     ptq_diff = jnp.max(jnp.abs(fp_output - ptq_output))
     print(f"PTQ max error:  {ptq_diff:.6f}")

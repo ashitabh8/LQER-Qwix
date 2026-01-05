@@ -38,6 +38,8 @@ qwix/
 
 # Experiments folder (contains old structure)
 experiments/
+examples/
+tmp/
 
 # Temporary files
 *.log
