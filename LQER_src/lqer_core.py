@@ -5,11 +5,33 @@ This module provides the core functionality for LQER quantization:
 - LqerWeight: Container for quantized weight + error correction matrices
 - lqer_quantize_params: Function to quantize parameters with LQER
 - LqerProvider: Inference provider that applies error correction
+- benchmark_lqer_model: Helper function for accurate per-layer timing
+
+Timing/Benchmarking:
+    For per-layer runtime benchmarking, use:
+    
+    1. Enable timing in LqerProvider:
+       provider = LqerProvider(rules, enable_timing=True)
+    
+    2. Use benchmark_lqer_model() for accurate results:
+       results = benchmark_lqer_model(model, params, input, num_runs=10)
+    
+    3. Or access timing data directly:
+       LqerProvider.print_timings()
+       timings = LqerProvider.get_timings()
+    
+    Note: For most accurate per-layer timing, consider using JAX's profiler:
+    ```python
+    with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
+        output = model.apply(variables, input)
+        output.block_until_ready()
+    ```
 """
 
 import dataclasses
 from typing import Any, Callable
 import re
+import time
 import jax
 import jax.numpy as jnp
 import flax
@@ -17,6 +39,13 @@ from flax import linen as nn
 import qwix
 from qwix._src.providers import ptq
 from qwix._src import qconfig
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+from experiments.models.transformer import SimpleTransformer
+from experiments.models.simple_mlp import SimpleMLP
 
 
 # 1. Custom Rule to hold the Rank 'k'
@@ -37,6 +66,7 @@ class LqerWeight:
     w_q: qwix.QArray  # Quantized weight
     error_a: jax.Array  # Low-rank error matrix A (U * S)
     error_b: jax.Array  # Low-rank error matrix B (Vh)
+    layer_id: str = ""  # Identifier for this layer (e.g., parameter path)
     
     @property
     def shape(self):
@@ -120,7 +150,13 @@ def lqer_quantize_params(fp_params, abs_ptq_params, rules: list[LqerRule], debug
                 print(f"    -> LQER quantized: rank={k}, error_a={error_a.shape}, error_b={error_b.shape}")
             
             # 4. Store as LqerWeight directly (NOT inside WithAux)
-            lqer_container = LqerWeight(w_q=w_q_array, error_a=error_a, error_b=error_b)
+            # Include layer_id for timing/benchmarking purposes
+            lqer_container = LqerWeight(
+                w_q=w_q_array, 
+                error_a=error_a, 
+                error_b=error_b,
+                layer_id=path_str
+            )
             quantized_params[path] = lqer_container
         else:
             # Keep non-LQER params as-is
@@ -140,11 +176,15 @@ class LqerProvider(qconfig.QuantizationProvider):
     - Final output: y = y_q + correction
     """
     
-    def __init__(self, rules):
+    def __init__(self, rules, enable_timing=False):
         super().__init__(rules)
+        self.enable_timing = enable_timing
     
     # Class-level counters to track which code paths are executed
     _path_counts = {'lqer': 0, 'withaux_lqer': 0, 'withaux_qarray': 0, 'fallback': 0}
+    
+    # Class-level timing data: {layer_id: [time1, time2, ...]}
+    _layer_timings = {}
     
     def promote_dtype(self, *args, **kwargs):
         """Intercept promote_dtype to skip LqerWeight (handled later in dot_general)."""
@@ -161,11 +201,84 @@ class LqerProvider(qconfig.QuantizationProvider):
         cls._path_counts = {'lqer': 0, 'withaux_lqer': 0, 'withaux_qarray': 0, 'fallback': 0}
     
     @classmethod
+    def reset_timings(cls):
+        """Reset all layer timing data."""
+        cls._layer_timings = {}
+    
+    @classmethod
     def print_counts(cls):
         print("\n[DEBUG] Code path execution counts:")
         for path, count in cls._path_counts.items():
             status = "✓ CALLED" if count > 0 else "✗ NOT CALLED"
             print(f"  - {path}: {count} times ({status})")
+    
+    @classmethod
+    def get_timings(cls) -> dict[str, list[float]]:
+        """Get timing data for all layers.
+        
+        Returns:
+            Dict mapping layer_id to list of execution times (in seconds).
+        """
+        return cls._layer_timings.copy()
+    
+    @classmethod
+    def print_timings(cls, summary=True):
+        """Print timing statistics for all layers.
+        
+        Args:
+            summary: If True, print summary statistics. If False, print all individual timings.
+        """
+        if not cls._layer_timings:
+            print("\n[Timing] No timing data collected.")
+            return
+        
+        print("\n" + "=" * 70)
+        print("LAYER TIMING BENCHMARKS")
+        print("=" * 70)
+        
+        # Calculate statistics
+        stats = []
+        for layer_id, times in cls._layer_timings.items():
+            if times:
+                total = sum(times)
+                mean = total / len(times)
+                min_time = min(times)
+                max_time = max(times)
+                stats.append({
+                    'layer_id': layer_id,
+                    'count': len(times),
+                    'total_ms': total * 1000,
+                    'mean_ms': mean * 1000,
+                    'min_ms': min_time * 1000,
+                    'max_ms': max_time * 1000,
+                })
+        
+        # Sort by total time (descending)
+        stats.sort(key=lambda x: x['total_ms'], reverse=True)
+        
+        # Print table
+        print(f"\n{'Layer ID':<40} {'Count':<8} {'Total (ms)':<12} {'Mean (ms)':<12} {'Min (ms)':<12} {'Max (ms)':<12}")
+        print("-" * 100)
+        for stat in stats:
+            print(f"{stat['layer_id']:<40} {stat['count']:<8} {stat['total_ms']:<12.3f} {stat['mean_ms']:<12.3f} {stat['min_ms']:<12.3f} {stat['max_ms']:<12.3f}")
+        
+        if not summary:
+            print("\nDetailed timings:")
+            for layer_id, times in cls._layer_timings.items():
+                print(f"\n  {layer_id}:")
+                for i, t in enumerate(times):
+                    print(f"    Call {i+1}: {t*1000:.3f} ms")
+        
+        total_time = sum(sum(times) for times in cls._layer_timings.values())
+        print(f"\nTotal execution time: {total_time*1000:.3f} ms")
+        print("=" * 70)
+    
+    def _record_timing(self, layer_id: str, duration: float):
+        """Record timing for a layer (side effect, safe in JAX)."""
+        if self.enable_timing:
+            if layer_id not in LqerProvider._layer_timings:
+                LqerProvider._layer_timings[layer_id] = []
+            LqerProvider._layer_timings[layer_id].append(duration)
     
     def dot_general(
         self,
@@ -182,6 +295,9 @@ class LqerProvider(qconfig.QuantizationProvider):
         # This is called when lqer_quantize_params stores LqerWeight directly
         if isinstance(rhs, LqerWeight):
             LqerProvider._path_counts['lqer'] += 1
+            
+            # Start timing if enabled
+            start_time = time.perf_counter() if self.enable_timing else None
             
             # 1. Dequantize and compute main quantized path
             w_dequant = qwix.dequantize(rhs.w_q)
@@ -208,7 +324,15 @@ class LqerProvider(qconfig.QuantizationProvider):
                 )
                 correction = intermediate @ rhs.error_b
             
-            return y_q + correction
+            result = y_q + correction
+            
+            # Record timing if enabled
+            if self.enable_timing and start_time is not None:
+                layer_id = rhs.layer_id if rhs.layer_id else f"unknown_{id(rhs)}"
+                duration = time.perf_counter() - start_time
+                self._record_timing(layer_id, duration)
+            
+            return result
         
         # PATH 2: WithAux wrapper (for compatibility/future use)
         # This handles cases where LqerWeight might be wrapped in WithAux,
@@ -271,7 +395,7 @@ def test_simple_mlp():
     for rank in [8, 16]:
         print(f"\n--- Testing with rank={rank} ---")
         rules = [LqerRule(module_path='.*', weight_qtype=jnp.int4, rank=rank)]
-        _run_single_test(model, fp_variables, fp_output, model_input, rules, key)
+        _run_single_test(model, fp_variables, fp_output, model_input, rules, key, enable_timing=True)
 
 
 def test_transformer():
@@ -325,7 +449,7 @@ def test_transformer():
     rank = 16
     print(f"\n--- Testing with rank={rank} ---")
     rules = [LqerRule(module_path='.*', weight_qtype=jnp.int4, rank=rank)]
-    _run_single_test(model, fp_variables, fp_output, tokens, rules, key)
+    _run_single_test(model, fp_variables, fp_output, tokens, rules, key, enable_timing=True)
 
 
 def run_lqer_test():
@@ -345,10 +469,105 @@ def run_lqer_test():
     print("=" * 70)
 
 
-def _run_single_test(model, fp_variables, fp_output, model_input, rules, key):
-    """Run a single LQER test with the given rules."""
+def benchmark_lqer_model(
+    model,
+    lqer_params: dict,
+    model_input: Any,
+    num_warmup: int = 3,
+    num_runs: int = 10,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """
+    Benchmark LQER model with proper JAX blocking for accurate per-layer timing.
+    
+    This function runs the model multiple times and properly blocks after each execution
+    to get accurate timing measurements. It's the recommended way to benchmark LQER models.
+    
+    IMPORTANT: The model must be created with a LqerProvider that has enable_timing=True
+    for this function to collect per-layer timings.
+    
+    Args:
+        model: The quantized LQER model (must be created with LqerProvider(enable_timing=True))
+        lqer_params: Quantized parameters dict
+        model_input: Input to the model
+        num_warmup: Number of warmup runs (to compile JIT, etc.)
+        num_runs: Number of benchmark runs
+        verbose: If True, print timing results
+    
+    Returns:
+        Dict with timing statistics: {
+            'layer_timings': {layer_id: [times...]},
+            'total_time': total execution time (seconds),
+            'mean_time': mean execution time per run (seconds),
+            'num_runs': number of benchmark runs,
+        }
+    
+    Example:
+        >>> rules = [LqerRule(module_path='.*', weight_qtype=jnp.int4, rank=16)]
+        >>> provider = LqerProvider(rules, enable_timing=True)
+        >>> model = qwix.quantize_model(base_model, provider)
+        >>> params = lqer_quantize_params(fp_params, abs_params, rules)
+        >>> results = benchmark_lqer_model(model, params, input_data, num_runs=20)
+    """
+    # Run warmup
+    if verbose:
+        print(f"Warming up ({num_warmup} runs)...")
+    for _ in range(num_warmup):
+        output = model.apply({'params': lqer_params}, model_input)
+        output.block_until_ready()
+    
+    # Reset timings before benchmark
+    LqerProvider.reset_timings()
+    
+    # Benchmark runs
+    if verbose:
+        print(f"Benchmarking ({num_runs} runs)...")
+    
+    total_start = time.perf_counter()
+    for run_idx in range(num_runs):
+        output = model.apply({'params': lqer_params}, model_input)
+        output.block_until_ready()  # Block to ensure computation completes
+        
+        if verbose and (run_idx + 1) % max(1, num_runs // 10) == 0:
+            print(f"  Run {run_idx + 1}/{num_runs} completed")
+    
+    total_end = time.perf_counter()
+    total_time = total_end - total_start
+    mean_time = total_time / num_runs
+    
+    timings = LqerProvider.get_timings()
+    
+    if verbose:
+        print(f"\nBenchmark complete:")
+        print(f"  Total time: {total_time*1000:.2f} ms")
+        print(f"  Mean time per run: {mean_time*1000:.2f} ms")
+        if timings:
+            LqerProvider.print_timings()
+        else:
+            print("  Note: No per-layer timings collected. Ensure model was created with enable_timing=True")
+    
+    return {
+        'layer_timings': timings,
+        'total_time': total_time,
+        'mean_time': mean_time,
+        'num_runs': num_runs,
+    }
+
+
+def _run_single_test(model, fp_variables, fp_output, model_input, rules, key, enable_timing=False):
+    """Run a single LQER test with the given rules.
+    
+    Args:
+        model: The model to test
+        fp_variables: FP32 model variables
+        fp_output: FP32 model output for comparison
+        model_input: Input to the model
+        rules: LQER quantization rules
+        key: JAX random key
+        enable_timing: If True, collect and print timing benchmarks
+    """
     # Quantize the Model (Architecture only)
-    lqer_model = qwix.quantize_model(model, LqerProvider(rules))
+    lqer_model = qwix.quantize_model(model, LqerProvider(rules, enable_timing=enable_timing))
     
     # Quantize the Params (The SVD happens here!)
     temp_ptq_model = qwix.quantize_model(model, qwix.PtqProvider(rules))
@@ -357,10 +576,17 @@ def _run_single_test(model, fp_variables, fp_output, model_input, rules, key):
     
     # Run Inference
     LqerProvider.reset_counts()
+    if enable_timing:
+        LqerProvider.reset_timings()
+    
     lqer_output = lqer_model.apply({'params': lqer_params}, model_input)
     
     # Show which code paths were executed
     LqerProvider.print_counts()
+    
+    # Print timing if enabled
+    if enable_timing:
+        LqerProvider.print_timings()
     
     # Compare with FP32
     max_diff = jnp.max(jnp.abs(fp_output - lqer_output))
