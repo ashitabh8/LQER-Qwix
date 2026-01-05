@@ -18,7 +18,9 @@ LQER improves quantized model accuracy by storing a low-rank approximation of th
 
 This achieves **29-60% error reduction** with minimal storage overhead.
 
-## Key Results
+## Accuracy
+
+**Note:** Currently tested on randomly generated input and weights.
 
 | Model | Quantization | PTQ Error | LQER Error | Improvement |
 |-------|-------------|-----------|------------|-------------|
@@ -155,16 +157,6 @@ LqerRule(..., rank=16)  # ~20-30% improvement, balanced
 LqerRule(..., rank=32)  # ~40-60% improvement, higher storage
 ```
 
-### Storage Overhead
-
-For weight matrix (M, N) with rank k:
-- **PTQ**: M × N × qtype_size + scales
-- **LQER**: PTQ + (M × k + k × N) × FP32
-
-Example: (1024, 1024) INT4 with rank=32:
-- PTQ: ~524KB
-- LQER: ~780KB (49% overhead)
-
 ## Tested With
 
 - **Qwix**: Commit `5c9ba31` (December 2024)
@@ -174,7 +166,18 @@ Example: (1024, 1024) INT4 with rank=32:
 
 ## Citing
 
-If you use LQER in your research, please cite this repository and [Qwix](https://github.com/google/qwix):
+If you use LQER in your research, please cite the original paper:
+
+```bibtex
+@article{zhang2024lqer,
+  title={LQER: Low-Rank Quantization Error Reconstruction for LLMs},
+  author={Zhang, Cheng and Cheng, Jianyi and Constantinides, George A and Zhao, Yiren},
+  journal={arXiv preprint arXiv:2402.02446},
+  year={2024}
+}
+```
+
+And this implementation:
 
 ```bibtex
 @software{lqer2025,
