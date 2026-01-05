@@ -1,0 +1,18 @@
+# LQER-Qwix Requirements
+# Low-rank Quantization Error Reconstruction extension for Qwix
+
+# Core dependency: Qwix at specific tested commit
+# This ensures compatibility with the LQER implementation
+git+https://github.com/google/qwix.git@5c9ba31#egg=qwix
+
+# JAX ecosystem (automatically installed with qwix, but listed for reference)
+# jax>=0.4.20
+# jaxlib>=0.4.20
+# flax>=0.8.0
+# numpy>=1.24.0
+
+# Note: After cloning this repo, run:
+#   python3 -m venv env
+#   source env/bin/activate  # On Windows: env\Scripts\activate
+#   pip install -r requirements.txt
+
